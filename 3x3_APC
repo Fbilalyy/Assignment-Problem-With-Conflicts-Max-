@@ -1,287 +1,434 @@
 #!/usr/bin/env python3
 """
-APC 3x3 Demo — Random Instance Generator & Solver
-Generates a random 3×3 Assignment Problem with Conflicts,
-visualizes the cost matrix + conflict map, and solves it
-by enumerating all feasible perfect matchings.
+APC 3×3 Step-by-Step Demo
+─────────────────────────
+Generates a random 3×3 Assignment Problem with Conflicts and solves it
+using the Lagrangian Relaxation + Subgradient Optimization framework:
+
+  1. Hungarian algorithm → Upper Bound (UB)
+  2. Repair heuristic   → Lower Bound (LB)
+  3. Subgradient update  → tighten UB↓ and LB↑ toward optimality
+
+Every iteration is printed in full detail so you can follow the
+convergence.
 
 Usage:
-    python apc_demo_3x3.py              # random instance
-    python apc_demo_3x3.py --seed 42    # reproducible instance
+    python apc_demo_3x3.py                # random instance
+    python apc_demo_3x3.py --seed 7       # reproducible
+    python apc_demo_3x3.py --n-conflicts 3
 """
 
 import numpy as np
-import itertools
-import argparse
+from scipy.optimize import linear_sum_assignment
+import argparse, itertools
 
+
+# ═══════════════════════════════════════════════════════════════
+#  INSTANCE GENERATOR
+# ═══════════════════════════════════════════════════════════════
 
 def generate_instance(n=3, max_cost=20, n_conflicts=None, seed=None):
-    """Generate a random n×n APC instance.
-
-    Returns:
-        cost_matrix: n×n integer cost matrix
-        conflicts: list of (i1,j1,i2,j2) conflict tuples
-    """
     rng = np.random.default_rng(seed)
+    cost = rng.integers(1, max_cost + 1, size=(n, n))
 
-    # Random cost matrix (positive integers)
-    cost_matrix = rng.integers(1, max_cost + 1, size=(n, n))
-
-    # Generate all possible edge pairs for conflicts
+    # All valid edge pairs for conflicts (different row AND different column)
     edges = [(i, j) for i in range(n) for j in range(n)]
-    edge_pairs = []
-    for a in range(len(edges)):
-        for b in range(a + 1, len(edges)):
-            e1, e2 = edges[a], edges[b]
-            # Skip pairs sharing a row or column (already mutually exclusive in matching)
-            if e1[0] == e2[0] or e1[1] == e2[1]:
-                continue
-            edge_pairs.append((e1[0], e1[1], e2[0], e2[1]))
+    pairs = [(edges[a], edges[b])
+             for a in range(len(edges)) for b in range(a + 1, len(edges))
+             if edges[a][0] != edges[b][0] and edges[a][1] != edges[b][1]]
 
-    # Pick random conflicts
     if n_conflicts is None:
-        n_conflicts = rng.integers(1, max(2, len(edge_pairs) // 2 + 1))
-    n_conflicts = min(n_conflicts, len(edge_pairs))
+        n_conflicts = rng.integers(1, max(2, len(pairs) // 2 + 1))
+    n_conflicts = min(n_conflicts, len(pairs))
 
-    chosen = rng.choice(len(edge_pairs), size=n_conflicts, replace=False)
-    conflicts = [edge_pairs[i] for i in sorted(chosen)]
-
-    return cost_matrix, conflicts
-
-
-def solve_brute_force(cost_matrix, conflicts, n=3):
-    """Enumerate all n! permutations, filter feasible, return optimal."""
-    conflict_set = set()
-    for (i1, j1, i2, j2) in conflicts:
-        conflict_set.add(((i1, j1), (i2, j2)))
-        conflict_set.add(((i2, j2), (i1, j1)))
-
-    all_perms = list(itertools.permutations(range(n)))
-    results = []
-
-    for perm in all_perms:
-        assignment = [(i, perm[i]) for i in range(n)]
-
-        # Check conflicts
-        feasible = True
-        violated = []
-        for ci, (i1, j1, i2, j2) in enumerate(conflicts):
-            if (i1, j1) in assignment and (i2, j2) in assignment:
-                feasible = False
-                violated.append(ci)
-
-        obj = sum(cost_matrix[i, j] for i, j in assignment)
-        results.append({
-            "perm": perm,
-            "assignment": assignment,
-            "obj": obj,
-            "feasible": feasible,
-            "violated": violated,
-        })
-
-    return results
+    chosen = rng.choice(len(pairs), size=n_conflicts, replace=False)
+    conflicts = [(pairs[i][0][0], pairs[i][0][1],
+                  pairs[i][1][0], pairs[i][1][1]) for i in sorted(chosen)]
+    return cost, conflicts
 
 
-def print_matrix(matrix, title, highlight=None):
-    """Pretty-print a matrix with optional cell highlights."""
-    n = matrix.shape[0]
-    print(f"\n  {title}")
-    print("  " + "─" * (6 * n + 1))
+# ═══════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════
 
-    # Column headers
-    header = "      "
-    for j in range(n):
-        header += f" T{j+1}  "
-    print(header)
-    print("  " + "─" * (6 * n + 1))
+def find_violations(assignment, conflicts):
+    """Return list of violated conflict indices."""
+    aset = set(assignment)
+    return [k for k, (i1, j1, i2, j2) in enumerate(conflicts)
+            if (i1, j1) in aset and (i2, j2) in aset]
 
+
+def repair_solution(assignment, cost, conflicts, n):
+    """Greedy swap repair: resolve each violated conflict by swapping
+    one conflicting edge with the best alternative partner."""
+    agent2task = {i: j for i, j in assignment}
+    task2agent = {j: i for i, j in assignment}
+
+    for _ in range(len(conflicts) * 5):
+        asgn = [(i, agent2task[i]) for i in range(n)]
+        viols = find_violations(asgn, conflicts)
+        if not viols:
+            break
+
+        i1, j1, i2, j2 = conflicts[viols[0]]
+        best_agent, best_task, best_delta = -1, -1, -np.inf
+
+        for swap_agent in [i1, i2]:
+            cur = agent2task[swap_agent]
+            for new in range(n):
+                if new == cur:
+                    continue
+                other = task2agent[new]
+                delta = (cost[swap_agent, new] + cost[other, cur]
+                         - cost[swap_agent, cur] - cost[other, new])
+                if delta > best_delta:
+                    best_delta, best_task, best_agent = delta, new, swap_agent
+
+        if best_agent >= 0:
+            old_task = agent2task[best_agent]
+            other = task2agent[best_task]
+            agent2task[best_agent], agent2task[other] = best_task, old_task
+            task2agent[best_task], task2agent[old_task] = best_agent, other
+
+    final = [(i, agent2task[i]) for i in range(n)]
+    obj = float(sum(cost[i, j] for i, j in final))
+    feasible = len(find_violations(final, conflicts)) == 0
+    return final, obj, feasible
+
+
+def brute_force_optimal(cost, conflicts, n):
+    """Enumerate n! to find true optimal (for verification)."""
+    best_obj, best_asgn = -np.inf, None
+    for perm in itertools.permutations(range(n)):
+        asgn = [(i, perm[i]) for i in range(n)]
+        if find_violations(asgn, conflicts):
+            continue
+        obj = sum(cost[i, j] for i, j in asgn)
+        if obj > best_obj:
+            best_obj, best_asgn = obj, asgn
+    return best_asgn, best_obj
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PRETTY PRINTERS
+# ═══════════════════════════════════════════════════════════════
+
+def fmt_matrix(mat, title, highlight=None, fmt=".2f"):
+    """Return pretty matrix string."""
+    n = mat.shape[0]
+    lines = [f"  {title}"]
+    hdr = "       " + "".join(f"  T{j+1}    " for j in range(n))
+    lines.append(hdr)
+    lines.append("  " + "─" * (8 * n + 4))
     for i in range(n):
-        row_str = f"  A{i+1} │"
+        row = f"  A{i+1} │"
         for j in range(n):
-            val = f"{matrix[i, j]:4d}"
+            val = f"{mat[i,j]:{fmt}}"
             if highlight and (i, j) in highlight:
-                row_str += f" [{val}]"
+                row += f" [{val:>6s}]"
             else:
-                row_str += f"  {val} "
-        print(row_str)
-    print("  " + "─" * (6 * n + 1))
+                row += f"  {val:>6s} "
+        lines.append(row)
+    lines.append("  " + "─" * (8 * n + 4))
+    return "\n".join(lines)
 
 
-def print_conflicts(conflicts, n=3):
-    """Print conflict list and conflict map."""
-    print(f"\n  CONFLICT LIST ({len(conflicts)} conflicts)")
-    print("  " + "─" * 40)
-    for ci, (i1, j1, i2, j2) in enumerate(conflicts):
-        print(f"  C{ci+1}: (A{i1+1},T{j1+1}) conflicts with (A{i2+1},T{j2+1})")
-        print(f"       x_{i1}{j1} + x_{i2}{j2} <= 1")
-
-    # Conflict density
-    max_possible = n * n * (n * n - 1) // 2 - n * (n * (n - 1))  # exclude same-row/col
-    # Actually: edges that can conflict = edges from different rows AND different columns
-    valid_pairs = 0
-    edges = [(i, j) for i in range(n) for j in range(n)]
-    for a in range(len(edges)):
-        for b in range(a + 1, len(edges)):
-            if edges[a][0] != edges[b][0] and edges[a][1] != edges[b][1]:
-                valid_pairs += 1
-    print(f"\n  Conflict density: {len(conflicts)}/{valid_pairs} possible pairs "
-          f"({100*len(conflicts)/valid_pairs:.0f}%)")
+def fmt_assignment(asgn, cost):
+    parts = []
+    for i, j in sorted(asgn):
+        parts.append(f"A{i+1}→T{j+1}({cost[i,j]})")
+    return ", ".join(parts) + f"  = {sum(cost[i,j] for i,j in asgn)}"
 
 
-def print_conflict_map(cost_matrix, conflicts, n=3):
-    """Print a visual conflict map on the cost grid."""
-    print(f"\n  CONFLICT MAP (edges that conflict with each other)")
-    print("  " + "─" * 50)
+# ═══════════════════════════════════════════════════════════════
+#  SUBGRADIENT SOLVER  (step-by-step verbose)
+# ═══════════════════════════════════════════════════════════════
 
-    # For each cell, list which conflicts it's involved in
-    involvement = {}
-    for ci, (i1, j1, i2, j2) in enumerate(conflicts):
-        involvement.setdefault((i1, j1), []).append(f"C{ci+1}")
-        involvement.setdefault((i2, j2), []).append(f"C{ci+1}")
+def subgradient_solve_verbose(cost, conflicts, n,
+                              max_iter=50, alpha_init=2.0, alpha_min=0.005):
+    """Full Lagrangian relaxation with subgradient — prints every step."""
 
-    header = "         "
-    for j in range(n):
-        header += f"  T{j+1}       "
-    print(header)
-    print("  " + "─" * (12 * n + 1))
+    nc = len(conflicts)
+    e1_i = np.array([c[0] for c in conflicts])
+    e1_j = np.array([c[1] for c in conflicts])
+    e2_i = np.array([c[2] for c in conflicts])
+    e2_j = np.array([c[3] for c in conflicts])
 
-    for i in range(n):
-        row_str = f"  A{i+1}  │"
-        for j in range(n):
-            tags = involvement.get((i, j), [])
-            cell = f" {cost_matrix[i,j]:2d}"
-            if tags:
-                cell += f"({','.join(tags)})"
-            else:
-                cell += "      "
-            row_str += f"{cell:11s}"
-        print(row_str)
-    print("  " + "─" * (12 * n + 1))
+    # ── Initialization ──
+    lam = np.zeros(nc)
+    alpha = alpha_init
+    best_ub = np.inf
+    best_lb = -np.inf
+    best_asgn = None
+    no_improve = 0
 
+    print("\n" + "=" * 70)
+    print("  SUBGRADIENT OPTIMIZATION — Iteration Log")
+    print("=" * 70)
 
-def print_all_matchings(results, conflicts):
-    """Print all permutations with feasibility status."""
-    print(f"\n  ALL PERFECT MATCHINGS ({len(results)} total)")
-    print("  " + "─" * 65)
-    print(f"  {'#':>3}  {'Assignment':25s} {'Obj':>5}  {'Feasible':>8}  {'Violated':15s}")
-    print("  " + "─" * 65)
-
-    for k, r in enumerate(results):
-        asgn_str = ", ".join(f"(A{i+1},T{j+1})" for i, j in r["assignment"])
-        viol_str = ", ".join(f"C{v+1}" for v in r["violated"]) if r["violated"] else "—"
-        feas_mark = "YES" if r["feasible"] else "no"
-        print(f"  {k+1:3d}  {asgn_str:25s} {r['obj']:5d}  {feas_mark:>8s}  {viol_str}")
-    print("  " + "─" * 65)
-
-
-def print_solution(results, cost_matrix, conflicts, n=3):
-    """Print the optimal feasible solution."""
-    feasible = [r for r in results if r["feasible"]]
-
-    print(f"\n  {'='*55}")
-    print(f"  SOLUTION")
-    print(f"  {'='*55}")
-
-    if not feasible:
-        print("  No feasible solution exists!")
-        print("  All matchings violate at least one conflict constraint.")
-
-        # Show least-infeasible
-        best_infeas = min(results, key=lambda r: (len(r["violated"]), -r["obj"]))
-        print(f"\n  Least infeasible: {best_infeas['obj']} (violates {len(best_infeas['violated'])} constraints)")
-        return None
-
-    optimal = max(feasible, key=lambda r: r["obj"])
-
-    print(f"\n  Optimal feasible assignment (maximization):")
-    total = 0
-    for i, j in optimal["assignment"]:
-        c = cost_matrix[i, j]
-        total += c
-        print(f"    Agent {i+1} -> Task {j+1}  (cost = {c})")
-    print(f"\n  Optimal objective value: {optimal['obj']}")
-
-    # Compare with unconstrained optimal
-    unconstrained = max(results, key=lambda r: r["obj"])
-    if unconstrained["obj"] > optimal["obj"]:
-        print(f"  Unconstrained optimum:   {unconstrained['obj']}")
-        gap = unconstrained["obj"] - optimal["obj"]
-        print(f"  Price of conflicts:      {gap} ({100*gap/unconstrained['obj']:.1f}% reduction)")
-        if not unconstrained["feasible"]:
-            viol_str = ", ".join(f"C{v+1}" for v in unconstrained["violated"])
-            print(f"  (Unconstrained solution violates: {viol_str})")
+    # Initial Hungarian (no multipliers)
+    print("\n┌─ INITIALIZATION ─────────────────────────────────────────┐")
+    print(f"│  Lagrange multipliers λ = {lam.tolist()}")
+    print(f"│  Step-size parameter  α = {alpha}")
+    row, col = linear_sum_assignment(-cost)
+    init_asgn = list(zip(row.tolist(), col.tolist()))
+    init_obj = float(cost[row, col].sum())
+    viols = find_violations(init_asgn, conflicts)
+    print(f"│  Hungarian (original costs): {fmt_assignment(init_asgn, cost)}")
+    if viols:
+        print(f"│  ✗ Violations: {['C'+str(v+1) for v in viols]}")
+        repaired, rep_obj, feas = repair_solution(init_asgn, cost, conflicts, n)
+        if feas:
+            best_lb = rep_obj
+            best_asgn = repaired
+            print(f"│  Repair → {fmt_assignment(repaired, cost)}  [LB = {best_lb}]")
+        else:
+            print(f"│  Repair failed to find feasible solution")
     else:
-        print(f"  Conflicts do not affect the optimum — same as unconstrained!")
+        print(f"│  ✓ Feasible!  LB = {init_obj}")
+        best_lb = init_obj
+        best_asgn = init_asgn
+    best_ub = init_obj  # first UB
+    print(f"│  Initial bounds:  LB = {best_lb},  UB = {best_ub}")
+    print(f"└──────────────────────────────────────────────────────────┘")
 
-    # Show the assignment on the grid
-    highlight = set(optimal["assignment"])
-    print_matrix(cost_matrix, "OPTIMAL ASSIGNMENT (bracketed cells selected)", highlight)
+    for it in range(max_iter):
+        print(f"\n{'─'*70}")
+        print(f"  ITERATION {it + 1}  (α = {alpha:.4f})")
+        print(f"{'─'*70}")
 
-    return optimal
+        # ── Step 1: Modified costs ──
+        mod_cost = cost.copy().astype(float)
+        for p in range(nc):
+            mod_cost[e1_i[p], e1_j[p]] -= lam[p]
+            mod_cost[e2_i[p], e2_j[p]] -= lam[p]
+
+        print(f"\n  Step 1 — Modified costs  c'_ij = c_ij − Σ λ_p")
+        for p in range(nc):
+            print(f"    λ_{p+1} = {lam[p]:.4f}  "
+                  f"(penalizes edges ({e1_i[p]+1},{e1_j[p]+1}) and ({e2_i[p]+1},{e2_j[p]+1}))")
+        print(fmt_matrix(mod_cost, "Modified Cost Matrix", fmt=".2f"))
+
+        # ── Step 2: Hungarian on modified costs ──
+        row, col = linear_sum_assignment(-mod_cost)
+        asgn = list(zip(row.tolist(), col.tolist()))
+        lr_obj = float(mod_cost[row, col].sum()) + float(lam.sum())
+        orig_obj = float(cost[row, col].sum())
+
+        print(f"\n  Step 2 — Hungarian algorithm on modified costs")
+        print(f"    Solution: {fmt_assignment(asgn, cost)}")
+        print(f"    Σ c'_ij·x_ij = {mod_cost[row, col].sum():.2f}")
+        print(f"    Σ λ_p        = {lam.sum():.2f}")
+        print(f"    LR bound     = {lr_obj:.2f}  (upper bound on Z*)")
+
+        # ── Update UB ──
+        prev_ub = best_ub
+        if lr_obj < best_ub:
+            best_ub = lr_obj
+            print(f"    ★ New best UB = {best_ub:.2f}  (improved from {prev_ub:.2f})")
+        else:
+            print(f"    UB unchanged at {best_ub:.2f}")
+
+        # ── Step 3: Feasibility check + repair ──
+        viols = find_violations(asgn, conflicts)
+        print(f"\n  Step 3 — Feasibility check")
+        if not viols:
+            print(f"    ✓ No conflict violations!")
+            feas_obj = orig_obj
+            if feas_obj > best_lb:
+                best_lb = feas_obj
+                best_asgn = asgn
+                print(f"    ★ New best LB = {best_lb:.2f}")
+        else:
+            viol_strs = []
+            for v in viols:
+                i1, j1, i2, j2 = conflicts[v]
+                viol_strs.append(f"C{v+1}: ({i1+1},{j1+1})∧({i2+1},{j2+1})")
+            print(f"    ✗ Violated: {', '.join(viol_strs)}")
+            print(f"    → Applying repair heuristic...")
+            repaired, rep_obj, feas = repair_solution(asgn, cost, conflicts, n)
+            if feas:
+                print(f"    Repaired: {fmt_assignment(repaired, cost)}")
+                if rep_obj > best_lb:
+                    best_lb = rep_obj
+                    best_asgn = repaired
+                    print(f"    ★ New best LB = {best_lb:.2f}")
+                else:
+                    print(f"    LB unchanged at {best_lb:.2f}")
+            else:
+                print(f"    Repair failed — no feasible solution found this iteration")
+
+        # ── Gap ──
+        gap = (best_ub - best_lb) / abs(best_ub) * 100 if best_ub > 0 else 0
+        print(f"\n  Current bounds:  LB = {best_lb:.2f}  ≤  Z*  ≤  UB = {best_ub:.2f}")
+        print(f"  Gap = ({best_ub:.2f} − {best_lb:.2f}) / {best_ub:.2f} = {gap:.2f}%")
+
+        if gap < 0.01:
+            print(f"\n  ★★★ Gap closed — OPTIMAL FOUND ★★★")
+            break
+
+        # ── Step 4: Subgradient ──
+        x_mat = np.zeros((n, n))
+        x_mat[row, col] = 1.0
+        subgrad = 1.0 - x_mat[e1_i, e1_j] - x_mat[e2_i, e2_j]
+
+        print(f"\n  Step 4 — Subgradient  g_p = 1 − x_e1 − x_e2")
+        for p in range(nc):
+            xe1 = x_mat[e1_i[p], e1_j[p]]
+            xe2 = x_mat[e2_i[p], e2_j[p]]
+            print(f"    g_{p+1} = 1 − {xe1:.0f} − {xe2:.0f} = {subgrad[p]:+.0f}"
+                  f"  {'(violated — both selected)' if subgrad[p] < 0 else '(satisfied)' if subgrad[p] > 0 else '(binding — one selected)'}")
+
+        # Beasley obs. 6: mask non-improving directions
+        sg_step = subgrad.copy()
+        sg_step[(lam == 0) & (subgrad > 0)] = 0.0
+
+        # ── Step 5: Step size ──
+        sg_norm_sq = float(np.dot(sg_step, sg_step))
+        if sg_norm_sq < 1e-12:
+            print(f"\n  Subgradient norm ≈ 0 — terminating.")
+            break
+
+        target = best_lb if best_lb > -np.inf else 0.0
+        step = alpha * (lr_obj - target) / sg_norm_sq
+
+        print(f"\n  Step 5 — Step size (Beasley)")
+        print(f"    t = α × (Z_LR − Z_LB) / ‖g‖²")
+        print(f"    t = {alpha:.4f} × ({lr_obj:.2f} − {target:.2f}) / {sg_norm_sq:.2f}")
+        print(f"    t = {step:.4f}")
+
+        # ── Step 6: Multiplier update ──
+        lam_old = lam.copy()
+        lam = np.maximum(0.0, lam - step * subgrad)
+
+        print(f"\n  Step 6 — Multiplier update  λ_new = max(0, λ − t·g)")
+        for p in range(nc):
+            print(f"    λ_{p+1}: {lam_old[p]:.4f} − {step:.4f}×({subgrad[p]:+.0f}) "
+                  f"= {lam_old[p] - step * subgrad[p]:.4f} → {lam[p]:.4f}")
+
+        # ── Step 7: α halving ──
+        if best_ub >= prev_ub:
+            no_improve += 1
+        else:
+            no_improve = 0
+        if no_improve >= 3:  # shorter limit for 3x3 demo
+            alpha /= 2.0
+            no_improve = 0
+            print(f"\n  ⚠ No UB improvement for 3 iterations → α halved to {alpha:.4f}")
+
+        if alpha < alpha_min:
+            print(f"\n  α = {alpha:.4f} < {alpha_min} — terminating.")
+            break
+
+    # ── Final summary ──
+    gap = (best_ub - best_lb) / abs(best_ub) * 100 if best_ub > 0 else 0
+    return best_asgn, best_lb, best_ub, gap, it + 1
 
 
-def print_formulation(cost_matrix, conflicts, n=3):
-    """Print the full mathematical formulation."""
-    print(f"\n  MATHEMATICAL FORMULATION")
+# ═══════════════════════════════════════════════════════════════
+#  DISPLAY
+# ═══════════════════════════════════════════════════════════════
+
+def print_problem(cost, conflicts, n):
+    print(fmt_matrix(cost, "COST MATRIX (maximize)", fmt="d"))
+
+    print(f"\n  CONFLICTS ({len(conflicts)} total)")
     print("  " + "─" * 50)
-
-    # Objective
-    terms = []
-    for i in range(n):
-        for j in range(n):
-            terms.append(f"{cost_matrix[i,j]}*x_{i}{j}")
-    print(f"  max  {' + '.join(terms)}")
-
-    print(f"  s.t.")
-    # Row constraints
-    for i in range(n):
-        row_terms = " + ".join(f"x_{i}{j}" for j in range(n))
-        print(f"       {row_terms} = 1   (Agent {i+1})")
-    # Column constraints
-    for j in range(n):
-        col_terms = " + ".join(f"x_{i}{j}" for i in range(n))
-        print(f"       {col_terms} = 1   (Task {j+1})")
-    # Conflicts
     for ci, (i1, j1, i2, j2) in enumerate(conflicts):
-        print(f"       x_{i1}{j1} + x_{i2}{j2} <= 1   (C{ci+1})")
-    print(f"       x_ij in {{0,1}}")
+        print(f"  C{ci+1}: edge (A{i1+1},T{j1+1}) conflicts with (A{i2+1},T{j2+1})")
+        print(f"       i.e. x_{i1}{j1} + x_{i2}{j2} ≤ 1")
 
+    print(f"\n  FORMULATION")
+    print("  " + "─" * 50)
+    terms = [f"{cost[i,j]}·x_{i}{j}" for i in range(n) for j in range(n)]
+    print(f"  max  {' + '.join(terms)}")
+    print(f"  s.t.")
+    for i in range(n):
+        print(f"       {' + '.join(f'x_{i}{j}' for j in range(n))} = 1   (Agent {i+1})")
+    for j in range(n):
+        print(f"       {' + '.join(f'x_{i}{j}' for i in range(n))} = 1   (Task {j+1})")
+    for ci, (i1, j1, i2, j2) in enumerate(conflicts):
+        print(f"       x_{i1}{j1} + x_{i2}{j2} ≤ 1   (C{ci+1})")
+    print(f"       x_ij ∈ {{0,1}}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="3x3 APC Demo")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed")
-    parser.add_argument("--n", type=int, default=3, help="Problem size (default 3)")
-    parser.add_argument("--max-cost", type=int, default=20, help="Max cost value")
-    parser.add_argument("--n-conflicts", type=int, default=None, help="Number of conflicts")
+    parser = argparse.ArgumentParser(description="3×3 APC Subgradient Demo")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--n-conflicts", type=int, default=None)
+    parser.add_argument("--max-cost", type=int, default=20)
     args = parser.parse_args()
 
-    n = args.n
     seed = args.seed if args.seed is not None else np.random.default_rng().integers(0, 10000)
+    n = 3
 
-    print("=" * 60)
-    print(f"  APC DEMO — {n}x{n} Assignment Problem with Conflicts")
-    print(f"  Seed: {seed}")
-    print("=" * 60)
+    print("╔" + "═" * 68 + "╗")
+    print("║  APC 3×3 — Lagrangian Relaxation + Subgradient Optimization Demo  ║")
+    print("║  Hungarian → Upper Bound  |  Repair → Lower Bound                ║")
+    print("╚" + "═" * 68 + "╝")
+    print(f"  Seed: {seed}\n")
 
-    # Generate
-    cost_matrix, conflicts = generate_instance(
-        n=n, max_cost=args.max_cost, n_conflicts=args.n_conflicts, seed=seed
+    cost, conflicts = generate_instance(n=n, max_cost=args.max_cost,
+                                        n_conflicts=args.n_conflicts, seed=seed)
+
+    # Ensure instance is interesting: conflict bites unconstrained opt AND at least one feasible solution
+    for attempt in range(200):
+        row, col = linear_sum_assignment(-cost)
+        unc_asgn = list(zip(row.tolist(), col.tolist()))
+        bf_asgn, bf_obj = brute_force_optimal(cost, conflicts, n)
+        if find_violations(unc_asgn, conflicts) and bf_asgn is not None:
+            break  # good — conflict matters and feasible solution exists
+        seed += 1000
+        cost, conflicts = generate_instance(n=n, max_cost=args.max_cost,
+                                            n_conflicts=args.n_conflicts, seed=seed)
+    else:
+        print("  (Could not find ideal instance, proceeding anyway)")
+        bf_asgn, bf_obj = brute_force_optimal(cost, conflicts, n)
+
+    print_problem(cost, conflicts, n)
+
+    # Brute-force ground truth
+    if bf_asgn is not None:
+        print(f"\n  ── True optimal (brute-force verification) ──")
+        print(f"  {fmt_assignment(bf_asgn, cost)}")
+        print(f"  Z* = {bf_obj}")
+    else:
+        print(f"\n  ── No feasible solution exists (all matchings violate conflicts) ──")
+        bf_obj = None
+
+    # Subgradient solve (verbose)
+    best_asgn, best_lb, best_ub, gap, iters = subgradient_solve_verbose(
+        cost, conflicts, n, max_iter=30
     )
 
-    # Display
-    print_matrix(cost_matrix, "COST MATRIX")
-    print_conflicts(conflicts, n)
-    print_conflict_map(cost_matrix, conflicts, n)
-    print_formulation(cost_matrix, conflicts, n)
-
-    # Solve
-    results = solve_brute_force(cost_matrix, conflicts, n)
-    print_all_matchings(results, conflicts)
-    optimal = print_solution(results, cost_matrix, conflicts, n)
-
-    print(f"\n{'='*60}")
-
-    return cost_matrix, conflicts, results, optimal
+    # Final report
+    print("\n" + "═" * 70)
+    print("  FINAL RESULTS")
+    print("═" * 70)
+    if best_asgn is not None:
+        print(f"  Subgradient solution:  {fmt_assignment(best_asgn, cost)}")
+    else:
+        print(f"  Subgradient solution:  No feasible solution found")
+    print(f"  Lower Bound (LB):     {best_lb:.2f}")
+    print(f"  Upper Bound (UB):     {best_ub:.2f}")
+    print(f"  Gap:                  {gap:.2f}%")
+    print(f"  Iterations:           {iters}")
+    if bf_obj is not None:
+        print(f"  True optimal (Z*):    {bf_obj}")
+        if best_asgn is not None and best_lb == bf_obj:
+            print(f"  ✓ Subgradient found the true optimum!")
+        elif best_asgn is not None:
+            print(f"  Δ from optimal:       {bf_obj - best_lb:.2f}")
+    else:
+        print(f"  True optimal (Z*):    No feasible solution exists")
+    if best_asgn is not None:
+        highlight = set(best_asgn)
+        print(fmt_matrix(cost, "OPTIMAL ASSIGNMENT (selected cells in brackets)", highlight, fmt="d"))
+    print()
 
 
 if __name__ == "__main__":
