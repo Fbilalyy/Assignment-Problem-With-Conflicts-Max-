@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""
+APC Solver — Lagrangian Relaxation with Subgradient Optimization
+
+Mathematical formulation (Oncan 2013, Kuban 2019):
+
+    max  Σ c_ij · x_ij
+    s.t. Σ_j x_ij = 1              ∀i ∈ V₁   (agent matching)
+         Σ_i x_ij = 1              ∀j ∈ V₂   (task matching)
+         x_ij + x_kl ≤ 1           ∀{(i,j),(k,l)} ∈ C   (conflicts)
+         x_ij ∈ {0,1}
+
+Lagrangian relaxation (relax conflict constraints):
+
+    Z_LR(λ) = max Σ c'_ij · x_ij  +  Σ λ_p
+              s.t. perfect matching only
+
+    where c'_ij = c_ij − Σ_{p: (i,j)∈p} λ_p
+
+Subgradient update (Beasley):
+
+    g_p     = 1 − x*_{e1} − x*_{e2}         (subgradient)
+    t_k     = α · (Z_LR − Z_LB) / ‖g‖²     (step size)
+    λ_p^+   = max(0, λ_p − t · g_p)         (multiplier update)
+    α halved every 30 iterations without UB improvement
+
+Bound hierarchy (maximization):
+    Z_LB (feasible heuristic) ≤ Z* ≤ Z_LR(λ) (upper bound)
+"""
+
+import json
+import csv
+import os
+import sys
+import time
+import numpy as np
+from pathlib import Path
+from scipy.optimize import linear_sum_assignment
+
+try:
+    import gurobipy as gp
+    from gurobipy import GRB
+    HAS_GUROBI = True
+except ImportError:
+    HAS_GUROBI = False
+
+
+# ═══════════════════════════════════════════════════════════════
+#  UTILITY
+# ═══════════════════════════════════════════════════════════════
+
+def load_instance(filepath):
+    with open(filepath) as f:
+        return json.load(f)
+
+
+def find_violations(assignment_set, conflicts_arr):
+    """Return indices of violated conflicts given assignment set of (i,j) tuples."""
+    violated = []
+    for idx in range(len(conflicts_arr)):
+        i1, j1, i2, j2 = conflicts_arr[idx]
+        if (i1, j1) in assignment_set and (i2, j2) in assignment_set:
+            violated.append(idx)
+    return violated
+
+
+def find_violations_np(assignment, conflicts_arr, n):
+    """Fast vectorized violation check using numpy.
+
+    Args:
+        assignment: list of (i, j) tuples
+        conflicts_arr: list of [i1, j1, i2, j2] or numpy array
+        n: problem size
+
+    Returns: numpy array of violated conflict indices
+    """
+    if not conflicts_arr or len(conflicts_arr) == 0:
+        return np.array([], dtype=int)
+
+    # Build assignment matrix
+    asgn_matrix = np.zeros(n * n, dtype=bool)
+    for i, j in assignment:
+        asgn_matrix[i * n + j] = True
+
+    c = np.asarray(conflicts_arr, dtype=int)
+    flat_e1 = c[:, 0] * n + c[:, 1]
+    flat_e2 = c[:, 2] * n + c[:, 3]
+    violated = asgn_matrix[flat_e1] & asgn_matrix[flat_e2]
+    return np.where(violated)[0]
+
+
+def repair_solution_fast(assignment, cost_matrix, conflicts, n, max_rounds=None,
+                         time_limit=None):
+    """Fast conflict repair using vectorized violation detection.
+
+    Uses numpy-based find_violations for O(|C|) vectorized checks
+    instead of Python loop.
+    """
+    cost = np.array(cost_matrix, dtype=float) if not isinstance(cost_matrix, np.ndarray) else cost_matrix
+    agent_to_task = {}
+    task_to_agent = {}
+    for i, j in assignment:
+        agent_to_task[i] = j
+        task_to_agent[j] = i
+
+    if max_rounds is None:
+        max_rounds = min(len(conflicts) * 5, 10000)
+
+    t0 = time.time()
+
+    for rd in range(max_rounds):
+        if time_limit and (rd % 50 == 0) and time.time() - t0 > time_limit:
+            break
+
+        asgn = [(i, agent_to_task[i]) for i in range(n)]
+        viols = find_violations_np(asgn, conflicts, n)
+        if len(viols) == 0:
+            break
+
+        vidx = int(viols[0])
+        c = conflicts[vidx] if isinstance(conflicts, list) else conflicts[vidx]
+        i1, j1, i2, j2 = int(c[0]), int(c[1]), int(c[2]), int(c[3])
+
+        best_task = -1
+        best_delta = -float("inf")
+        best_swap_agent = -1
+
+        for swap_agent in [i1, i2]:
+            cur_task = agent_to_task[swap_agent]
+            for new_task in range(n):
+                if new_task == cur_task:
+                    continue
+                other_agent = task_to_agent[new_task]
+                delta = (
+                    cost[swap_agent, new_task]
+                    + cost[other_agent, cur_task]
+                    - cost[swap_agent, cur_task]
+                    - cost[other_agent, new_task]
+                )
+                if delta > best_delta:
+                    best_delta = delta
+                    best_task = new_task
+                    best_swap_agent = swap_agent
+
+        if best_swap_agent >= 0 and best_task >= 0:
+            swap_agent = best_swap_agent
+            cur_task = agent_to_task[swap_agent]
+            other_agent = task_to_agent[best_task]
+            agent_to_task[swap_agent] = best_task
+            agent_to_task[other_agent] = cur_task
+            task_to_agent[best_task] = swap_agent
+            task_to_agent[cur_task] = other_agent
+
+    final = [(i, agent_to_task[i]) for i in range(n)]
+    obj = float(sum(cost[i, j] for i, j in final))
+    viols = find_violations_np(final, conflicts, n)
+    feasible = len(viols) == 0
+    return final, obj, feasible
+
+
+# ═══════════════════════════════════════════════════════════════
+#  GUROBI EXACT SOLVER
+# ═══════════════════════════════════════════════════════════════
+
+def solve_exact_gurobi(instance, time_limit=300):
+    """Solve APC to optimality (or near-optimality) via Gurobi MIP."""
+    if not HAS_GUROBI:
+        return None
+
+    n = instance["n"]
+    cost = instance["cost_matrix"]
+    conflicts = instance["conflicts"]
+
+    t0 = time.time()
+
+    env = gp.Env(empty=True)
+    env.setParam("OutputFlag", 0)
+    env.start()
+    m = gp.Model("APC", env=env)
+    m.setParam("TimeLimit", time_limit)
+
+    x = {}
+    for i in range(n):
+        for j in range(n):
+            x[i, j] = m.addVar(vtype=GRB.BINARY, name=f"x_{i}_{j}")
+
+    m.setObjective(
+        gp.quicksum(cost[i][j] * x[i, j] for i in range(n) for j in range(n)),
+        GRB.MAXIMIZE,
+    )
+
+    # Agent constraints
+    for i in range(n):
+        m.addConstr(gp.quicksum(x[i, j] for j in range(n)) == 1)
+    # Task constraints
+    for j in range(n):
+        m.addConstr(gp.quicksum(x[i, j] for i in range(n)) == 1)
+    # Conflict constraints
+    for idx, (i1, j1, i2, j2) in enumerate(conflicts):
+        m.addConstr(x[i1, j1] + x[i2, j2] <= 1)
+
+    try:
+        m.optimize()
+    except gp.GurobiError as e:
+        return {"objective": None, "status": f"license_limit ({e})",
+                "time_sec": round(time.time() - t0, 4)}
+    elapsed = time.time() - t0
+
+    if m.status in (GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL):
+        assignment = []
+        for i in range(n):
+            for j in range(n):
+                if x[i, j].X > 0.5:
+                    assignment.append([i, j])
+        return {
+            "objective": m.ObjVal,
+            "bound": m.ObjBound,
+            "gap_pct": round(m.MIPGap * 100, 4),
+            "assignment": assignment,
+            "time_sec": round(elapsed, 4),
+            "status": "optimal" if m.status == GRB.OPTIMAL else "time_limit",
+        }
+    else:
+        return {
+            "objective": None,
+            "status": "infeasible" if m.status == GRB.INFEASIBLE else str(m.status),
+            "time_sec": round(elapsed, 4),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  REPAIR HEURISTIC  (infeasible → feasible)
+# ═══════════════════════════════════════════════════════════════
+
+def repair_solution(assignment, cost_matrix, conflicts, n, max_rounds=None):
+    """
+    Greedy conflict-repair: iteratively resolve each violated conflict
+    by swapping one of the two conflicting edges with the best
+    alternative partner.  Tries BOTH sides of each conflict.
+
+    Returns (assignment_list, obj_value, is_feasible).
+    """
+    cost = np.array(cost_matrix, dtype=float) if not isinstance(cost_matrix, np.ndarray) else cost_matrix
+    agent_to_task = {}
+    task_to_agent = {}
+    for i, j in assignment:
+        agent_to_task[i] = j
+        task_to_agent[j] = i
+
+    if max_rounds is None:
+        max_rounds = min(len(conflicts) * 5, 10000)
+    for _ in range(max_rounds):
+        aset = {(i, agent_to_task[i]) for i in agent_to_task}
+        viols = find_violations(aset, conflicts)
+        if not viols:
+            break
+
+        # Pick violated conflict
+        vidx = viols[0]
+        i1, j1, i2, j2 = conflicts[vidx]
+
+        # Try swapping BOTH sides, pick whichever gives best result
+        best_task = -1
+        best_delta = -float("inf")
+        best_swap_agent = -1
+
+        for swap_agent in [i1, i2]:
+            cur_task = agent_to_task[swap_agent]
+            for new_task in range(n):
+                if new_task == cur_task:
+                    continue
+                other_agent = task_to_agent[new_task]
+                delta = (
+                    cost[swap_agent, new_task]
+                    + cost[other_agent, cur_task]
+                    - cost[swap_agent, cur_task]
+                    - cost[other_agent, new_task]
+                )
+                if delta > best_delta:
+                    best_delta = delta
+                    best_task = new_task
+                    best_swap_agent = swap_agent
+
+        if best_swap_agent >= 0 and best_task >= 0:
+            swap_agent = best_swap_agent
+            cur_task = agent_to_task[swap_agent]
+            other_agent = task_to_agent[best_task]
+            # execute swap
+            agent_to_task[swap_agent] = best_task
+            agent_to_task[other_agent] = cur_task
+            task_to_agent[best_task] = swap_agent
+            task_to_agent[cur_task] = other_agent
+
+    final = [(i, agent_to_task[i]) for i in range(n)]
+    obj = float(sum(cost[i, j] for i, j in final))
+    feasible = len(find_violations(set(final), conflicts)) == 0
+    return final, obj, feasible
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SUBGRADIENT OPTIMISATION  (Beasley's method)
+# ═══════════════════════════════════════════════════════════════
+
+def subgradient_solve(
+    instance,
+    max_iter=1000,
+    alpha_init=2.0,
+    alpha_min=0.005,
+    no_improve_limit=30,
+):
+    """
+    Lagrangian relaxation with subgradient optimisation for APC.
+
+    Relaxes conflict constraints x_ij + x_kl ≤ 1 into the objective.
+    Subproblem is a standard assignment problem solved by Hungarian algorithm.
+
+    Returns dict with best_lb, best_ub, gap, assignment, iterations, time.
+    """
+    n = instance["n"]
+    cost = np.array(instance["cost_matrix"], dtype=np.float64)
+    conflicts = [(c[0], c[1], c[2], c[3]) for c in instance["conflicts"]]
+    num_conflicts = len(conflicts)
+
+    t0 = time.time()
+
+    # ── trivial case: no conflicts ──
+    if num_conflicts == 0:
+        row, col = linear_sum_assignment(-cost)
+        obj = float(cost[row, col].sum())
+        asgn = list(zip(row.tolist(), col.tolist()))
+        return dict(
+            best_lb=obj, best_ub=obj, gap=0.0,
+            assignment=asgn, iterations=0,
+            time=round(time.time() - t0, 4), feasible=True, history=[],
+        )
+
+    # ── precompute conflict edge indices (vectorised) ──
+    e1_i = np.array([c[0] for c in conflicts], dtype=int)
+    e1_j = np.array([c[1] for c in conflicts], dtype=int)
+    e2_i = np.array([c[2] for c in conflicts], dtype=int)
+    e2_j = np.array([c[3] for c in conflicts], dtype=int)
+
+    # ── initialise Lagrange multipliers ──
+    lam = np.zeros(num_conflicts)
+
+    alpha = alpha_init
+    best_ub = float("inf")
+    best_lb = -float("inf")
+    best_assignment = None
+    no_improve_count = 0
+
+    # ── initial feasible solution (Hungarian + repair) ──
+    row, col = linear_sum_assignment(-cost)
+    init_asgn = list(zip(row.tolist(), col.tolist()))
+    init_set = set(init_asgn)
+    if not find_violations(init_set, conflicts):
+        best_lb = float(cost[row, col].sum())
+        best_assignment = init_asgn
+    else:
+        repaired, rep_obj, feas = repair_solution(init_asgn, cost, conflicts, n)
+        if feas:
+            best_lb = rep_obj
+            best_assignment = repaired
+
+    history = []
+
+    for it in range(max_iter):
+        # ─── Step 1: modified costs  c'_ij = c_ij − Σ λ_p ───
+        mod_cost = cost.copy()
+        # vectorised scatter-subtract
+        np.subtract.at(mod_cost, (e1_i, e1_j), lam)
+        np.subtract.at(mod_cost, (e2_i, e2_j), lam)
+
+        # ─── Step 2: solve assignment subproblem (Hungarian) ───
+        row, col = linear_sum_assignment(-mod_cost)
+
+        # Lagrangian bound = Σ c'_ij·x_ij  +  Σ λ_p
+        lr_obj = float(mod_cost[row, col].sum()) + float(lam.sum())
+
+        # ─── update upper bound ───
+        prev_ub = best_ub
+        if lr_obj < best_ub:
+            best_ub = lr_obj
+
+        # ─── Step 3: feasibility check & repair ───
+        asgn = list(zip(row.tolist(), col.tolist()))
+        asgn_set = set(asgn)
+        viols = find_violations(asgn_set, conflicts)
+
+        if not viols:
+            feas_obj = float(cost[row, col].sum())
+            if feas_obj > best_lb:
+                best_lb = feas_obj
+                best_assignment = asgn
+        else:
+            repaired, rep_obj, feas = repair_solution(asgn, cost, conflicts, n)
+            if feas and rep_obj > best_lb:
+                best_lb = rep_obj
+                best_assignment = repaired
+
+        # ─── gap ───
+        gap = 0.0
+        if best_lb > -float("inf") and best_ub < float("inf") and best_ub > 0:
+            gap = (best_ub - best_lb) / abs(best_ub) * 100
+
+        history.append(dict(
+            iteration=it, lr_bound=round(lr_obj, 2),
+            best_ub=round(best_ub, 2), best_lb=round(best_lb, 2),
+            gap=round(gap, 2), alpha=round(alpha, 6),
+            violations=len(viols),
+        ))
+
+        # ─── termination ───
+        if gap < 0.01:
+            break
+        if alpha < alpha_min:
+            break
+
+        # ─── Step 4: subgradient  g_p = 1 − x_{e1} − x_{e2} ───
+        x_mat = np.zeros((n, n))
+        x_mat[row, col] = 1.0
+        subgrad = 1.0 - x_mat[e1_i, e1_j] - x_mat[e2_i, e2_j]
+
+        # Beasley obs. 6: zero-multiplier & over-satisfied → exclude
+        sg_step = subgrad.copy()
+        sg_step[(lam == 0) & (subgrad > 0)] = 0.0
+
+        # ─── Step 5: step size ───
+        sg_norm_sq = float(np.dot(sg_step, sg_step))
+        if sg_norm_sq < 1e-12:
+            break
+
+        target = best_lb if best_lb > -float("inf") else 0.0
+        step = alpha * (lr_obj - target) / sg_norm_sq
+
+        # ─── Step 6: multiplier update ───
+        lam = np.maximum(0.0, lam - step * subgrad)
+
+        # ─── Step 7: alpha halving (Beasley) ───
+        if best_ub >= prev_ub:          # no improvement
+            no_improve_count += 1
+        else:
+            no_improve_count = 0
+        if no_improve_count >= no_improve_limit:
+            alpha /= 2.0
+            no_improve_count = 0
+
+    elapsed = time.time() - t0
+    gap = 0.0
+    if best_lb > -float("inf") and best_ub < float("inf") and best_ub > 0:
+        gap = (best_ub - best_lb) / abs(best_ub) * 100
+
+    return dict(
+        best_lb=best_lb,
+        best_ub=round(best_ub, 4),
+        gap=round(gap, 4),
+        assignment=best_assignment,
+        iterations=len(history),
+        time=round(elapsed, 4),
+        feasible=best_assignment is not None,
+        history=history,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════════
+
+def solve_instance(filepath, use_gurobi=True):
+    """Solve one APC instance with subgradient + optional Gurobi."""
+    inst = load_instance(filepath)
+    iid = inst["instance_id"]
+    n = inst["n"]
+    nc = inst["num_conflicts"]
+    print(f"  {iid}  n={n}  |P|={nc}", end="  ", flush=True)
+
+    # Subgradient
+    sg = subgradient_solve(inst)
+    print(f"SG: LB={sg['best_lb']:.0f} UB={sg['best_ub']:.0f} "
+          f"gap={sg['gap']:.2f}% iter={sg['iterations']} "
+          f"t={sg['time']:.1f}s", end="", flush=True)
+
+    result = {
+        "instance_id": iid,
+        "n": n,
+        "num_conflicts": nc,
+        "group": inst["metadata"]["group"],
+        "subgradient": {
+            "lower_bound": sg["best_lb"],
+            "upper_bound": sg["best_ub"],
+            "gap_pct": sg["gap"],
+            "assignment": sg["assignment"],
+            "iterations": sg["iterations"],
+            "time_sec": sg["time"],
+            "feasible": sg["feasible"],
+        },
+    }
+
+    # Gurobi exact
+    if use_gurobi and HAS_GUROBI:
+        gb = solve_exact_gurobi(inst)
+        if gb and gb.get("objective") is not None:
+            result["gurobi"] = gb
+            print(f"  |  GRB: opt={gb['objective']:.0f} "
+                  f"t={gb['time_sec']:.1f}s", end="", flush=True)
+
+    print()
+    return result
+
+
+def solve_all(instances_dir, solutions_dir=None):
+    """Solve all 100 instances, save individual solutions + summary CSV."""
+    if solutions_dir is None:
+        solutions_dir = os.path.join(os.path.dirname(instances_dir), "solutions")
+    os.makedirs(solutions_dir, exist_ok=True)
+
+    groups = ["xs", "s", "m", "l", "xl"]
+    summary = []
+
+    for grp in groups:
+        grp_in = os.path.join(instances_dir, grp)
+        if not os.path.isdir(grp_in):
+            continue
+        grp_out = os.path.join(solutions_dir, grp)
+        os.makedirs(grp_out, exist_ok=True)
+
+        files = sorted(f for f in os.listdir(grp_in) if f.endswith(".json"))
+        print(f"\n{'═'*60}")
+        print(f"  Group {grp.upper()}  ({len(files)} instances)")
+        print(f"{'═'*60}")
+
+        for fname in files:
+            res = solve_instance(os.path.join(grp_in, fname), use_gurobi=HAS_GUROBI)
+
+            # save individual solution
+            sol_path = os.path.join(grp_out, fname.replace(".json", "_sol.json"))
+            with open(sol_path, "w") as f:
+                json.dump(res, f, indent=2)
+
+            row = {
+                "instance_id": res["instance_id"],
+                "group": res["group"],
+                "n": res["n"],
+                "num_conflicts": res["num_conflicts"],
+                "sg_lb": res["subgradient"]["lower_bound"],
+                "sg_ub": res["subgradient"]["upper_bound"],
+                "sg_gap": res["subgradient"]["gap_pct"],
+                "sg_iter": res["subgradient"]["iterations"],
+                "sg_time": res["subgradient"]["time_sec"],
+                "sg_feasible": res["subgradient"]["feasible"],
+            }
+            if "gurobi" in res:
+                gb = res["gurobi"]
+                row["grb_optimal"] = gb.get("objective", "")
+                row["grb_gap"] = gb.get("gap_pct", "")
+                row["grb_time"] = gb.get("time_sec", "")
+                row["grb_status"] = gb.get("status", "")
+            summary.append(row)
+
+    # ── summary CSV ──
+    csv_path = os.path.join(solutions_dir, "solution_summary.csv")
+    if summary:
+        fields = list(summary[0].keys())
+        for r in summary:
+            for k in r:
+                if k not in fields:
+                    fields.append(k)
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(summary)
+
+    print(f"\n{'═'*60}")
+    print(f"  DONE — {len(summary)} instances solved")
+    print(f"  Solutions : {solutions_dir}")
+    print(f"  Summary   : {csv_path}")
+    print(f"  Gurobi    : {'YES' if HAS_GUROBI else 'NO'}")
+    print(f"{'═'*60}")
+    return summary
+
+
+# ═══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    base = os.path.dirname(os.path.abspath(__file__))
+    instances_dir = os.path.join(base, "instances")
+    solve_all(instances_dir)
