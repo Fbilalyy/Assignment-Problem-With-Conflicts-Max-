@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+APC 3x3 Demo — Random Instance Generator & Solver
+Generates a random 3×3 Assignment Problem with Conflicts,
+visualizes the cost matrix + conflict map, and solves it
+by enumerating all feasible perfect matchings.
+
+Usage:
+    python apc_demo_3x3.py              # random instance
+    python apc_demo_3x3.py --seed 42    # reproducible instance
+"""
+
+import numpy as np
+import itertools
+import argparse
+
+
+def generate_instance(n=3, max_cost=20, n_conflicts=None, seed=None):
+    """Generate a random n×n APC instance.
+
+    Returns:
+        cost_matrix: n×n integer cost matrix
+        conflicts: list of (i1,j1,i2,j2) conflict tuples
+    """
+    rng = np.random.default_rng(seed)
+
+    # Random cost matrix (positive integers)
+    cost_matrix = rng.integers(1, max_cost + 1, size=(n, n))
+
+    # Generate all possible edge pairs for conflicts
+    edges = [(i, j) for i in range(n) for j in range(n)]
+    edge_pairs = []
+    for a in range(len(edges)):
+        for b in range(a + 1, len(edges)):
+            e1, e2 = edges[a], edges[b]
+            # Skip pairs sharing a row or column (already mutually exclusive in matching)
+            if e1[0] == e2[0] or e1[1] == e2[1]:
+                continue
+            edge_pairs.append((e1[0], e1[1], e2[0], e2[1]))
+
+    # Pick random conflicts
+    if n_conflicts is None:
+        n_conflicts = rng.integers(1, max(2, len(edge_pairs) // 2 + 1))
+    n_conflicts = min(n_conflicts, len(edge_pairs))
+
+    chosen = rng.choice(len(edge_pairs), size=n_conflicts, replace=False)
+    conflicts = [edge_pairs[i] for i in sorted(chosen)]
+
+    return cost_matrix, conflicts
+
+
+def solve_brute_force(cost_matrix, conflicts, n=3):
+    """Enumerate all n! permutations, filter feasible, return optimal."""
+    conflict_set = set()
+    for (i1, j1, i2, j2) in conflicts:
+        conflict_set.add(((i1, j1), (i2, j2)))
+        conflict_set.add(((i2, j2), (i1, j1)))
+
+    all_perms = list(itertools.permutations(range(n)))
+    results = []
+
+    for perm in all_perms:
+        assignment = [(i, perm[i]) for i in range(n)]
+
+        # Check conflicts
+        feasible = True
+        violated = []
+        for ci, (i1, j1, i2, j2) in enumerate(conflicts):
+            if (i1, j1) in assignment and (i2, j2) in assignment:
+                feasible = False
+                violated.append(ci)
+
+        obj = sum(cost_matrix[i, j] for i, j in assignment)
+        results.append({
+            "perm": perm,
+            "assignment": assignment,
+            "obj": obj,
+            "feasible": feasible,
+            "violated": violated,
+        })
+
+    return results
+
+
+def print_matrix(matrix, title, highlight=None):
+    """Pretty-print a matrix with optional cell highlights."""
+    n = matrix.shape[0]
+    print(f"\n  {title}")
+    print("  " + "─" * (6 * n + 1))
+
+    # Column headers
+    header = "      "
+    for j in range(n):
+        header += f" T{j+1}  "
+    print(header)
+    print("  " + "─" * (6 * n + 1))
+
+    for i in range(n):
+        row_str = f"  A{i+1} │"
+        for j in range(n):
+            val = f"{matrix[i, j]:4d}"
+            if highlight and (i, j) in highlight:
+                row_str += f" [{val}]"
+            else:
+                row_str += f"  {val} "
+        print(row_str)
+    print("  " + "─" * (6 * n + 1))
+
+
+def print_conflicts(conflicts, n=3):
+    """Print conflict list and conflict map."""
+    print(f"\n  CONFLICT LIST ({len(conflicts)} conflicts)")
+    print("  " + "─" * 40)
+    for ci, (i1, j1, i2, j2) in enumerate(conflicts):
+        print(f"  C{ci+1}: (A{i1+1},T{j1+1}) conflicts with (A{i2+1},T{j2+1})")
+        print(f"       x_{i1}{j1} + x_{i2}{j2} <= 1")
+
+    # Conflict density
+    max_possible = n * n * (n * n - 1) // 2 - n * (n * (n - 1))  # exclude same-row/col
+    # Actually: edges that can conflict = edges from different rows AND different columns
+    valid_pairs = 0
+    edges = [(i, j) for i in range(n) for j in range(n)]
+    for a in range(len(edges)):
+        for b in range(a + 1, len(edges)):
+            if edges[a][0] != edges[b][0] and edges[a][1] != edges[b][1]:
+                valid_pairs += 1
+    print(f"\n  Conflict density: {len(conflicts)}/{valid_pairs} possible pairs "
+          f"({100*len(conflicts)/valid_pairs:.0f}%)")
+
+
+def print_conflict_map(cost_matrix, conflicts, n=3):
+    """Print a visual conflict map on the cost grid."""
+    print(f"\n  CONFLICT MAP (edges that conflict with each other)")
+    print("  " + "─" * 50)
+
+    # For each cell, list which conflicts it's involved in
+    involvement = {}
+    for ci, (i1, j1, i2, j2) in enumerate(conflicts):
+        involvement.setdefault((i1, j1), []).append(f"C{ci+1}")
+        involvement.setdefault((i2, j2), []).append(f"C{ci+1}")
+
+    header = "         "
+    for j in range(n):
+        header += f"  T{j+1}       "
+    print(header)
+    print("  " + "─" * (12 * n + 1))
+
+    for i in range(n):
+        row_str = f"  A{i+1}  │"
+        for j in range(n):
+            tags = involvement.get((i, j), [])
+            cell = f" {cost_matrix[i,j]:2d}"
+            if tags:
+                cell += f"({','.join(tags)})"
+            else:
+                cell += "      "
+            row_str += f"{cell:11s}"
+        print(row_str)
+    print("  " + "─" * (12 * n + 1))
+
+
+def print_all_matchings(results, conflicts):
+    """Print all permutations with feasibility status."""
+    print(f"\n  ALL PERFECT MATCHINGS ({len(results)} total)")
+    print("  " + "─" * 65)
+    print(f"  {'#':>3}  {'Assignment':25s} {'Obj':>5}  {'Feasible':>8}  {'Violated':15s}")
+    print("  " + "─" * 65)
+
+    for k, r in enumerate(results):
+        asgn_str = ", ".join(f"(A{i+1},T{j+1})" for i, j in r["assignment"])
+        viol_str = ", ".join(f"C{v+1}" for v in r["violated"]) if r["violated"] else "—"
+        feas_mark = "YES" if r["feasible"] else "no"
+        print(f"  {k+1:3d}  {asgn_str:25s} {r['obj']:5d}  {feas_mark:>8s}  {viol_str}")
+    print("  " + "─" * 65)
+
+
+def print_solution(results, cost_matrix, conflicts, n=3):
+    """Print the optimal feasible solution."""
+    feasible = [r for r in results if r["feasible"]]
+
+    print(f"\n  {'='*55}")
+    print(f"  SOLUTION")
+    print(f"  {'='*55}")
+
+    if not feasible:
+        print("  No feasible solution exists!")
+        print("  All matchings violate at least one conflict constraint.")
+
+        # Show least-infeasible
+        best_infeas = min(results, key=lambda r: (len(r["violated"]), -r["obj"]))
+        print(f"\n  Least infeasible: {best_infeas['obj']} (violates {len(best_infeas['violated'])} constraints)")
+        return None
+
+    optimal = max(feasible, key=lambda r: r["obj"])
+
+    print(f"\n  Optimal feasible assignment (maximization):")
+    total = 0
+    for i, j in optimal["assignment"]:
+        c = cost_matrix[i, j]
+        total += c
+        print(f"    Agent {i+1} -> Task {j+1}  (cost = {c})")
+    print(f"\n  Optimal objective value: {optimal['obj']}")
+
+    # Compare with unconstrained optimal
+    unconstrained = max(results, key=lambda r: r["obj"])
+    if unconstrained["obj"] > optimal["obj"]:
+        print(f"  Unconstrained optimum:   {unconstrained['obj']}")
+        gap = unconstrained["obj"] - optimal["obj"]
+        print(f"  Price of conflicts:      {gap} ({100*gap/unconstrained['obj']:.1f}% reduction)")
+        if not unconstrained["feasible"]:
+            viol_str = ", ".join(f"C{v+1}" for v in unconstrained["violated"])
+            print(f"  (Unconstrained solution violates: {viol_str})")
+    else:
+        print(f"  Conflicts do not affect the optimum — same as unconstrained!")
+
+    # Show the assignment on the grid
+    highlight = set(optimal["assignment"])
+    print_matrix(cost_matrix, "OPTIMAL ASSIGNMENT (bracketed cells selected)", highlight)
+
+    return optimal
+
+
+def print_formulation(cost_matrix, conflicts, n=3):
+    """Print the full mathematical formulation."""
+    print(f"\n  MATHEMATICAL FORMULATION")
+    print("  " + "─" * 50)
+
+    # Objective
+    terms = []
+    for i in range(n):
+        for j in range(n):
+            terms.append(f"{cost_matrix[i,j]}*x_{i}{j}")
+    print(f"  max  {' + '.join(terms)}")
+
+    print(f"  s.t.")
+    # Row constraints
+    for i in range(n):
+        row_terms = " + ".join(f"x_{i}{j}" for j in range(n))
+        print(f"       {row_terms} = 1   (Agent {i+1})")
+    # Column constraints
+    for j in range(n):
+        col_terms = " + ".join(f"x_{i}{j}" for i in range(n))
+        print(f"       {col_terms} = 1   (Task {j+1})")
+    # Conflicts
+    for ci, (i1, j1, i2, j2) in enumerate(conflicts):
+        print(f"       x_{i1}{j1} + x_{i2}{j2} <= 1   (C{ci+1})")
+    print(f"       x_ij in {{0,1}}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="3x3 APC Demo")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--n", type=int, default=3, help="Problem size (default 3)")
+    parser.add_argument("--max-cost", type=int, default=20, help="Max cost value")
+    parser.add_argument("--n-conflicts", type=int, default=None, help="Number of conflicts")
+    args = parser.parse_args()
+
+    n = args.n
+    seed = args.seed if args.seed is not None else np.random.default_rng().integers(0, 10000)
+
+    print("=" * 60)
+    print(f"  APC DEMO — {n}x{n} Assignment Problem with Conflicts")
+    print(f"  Seed: {seed}")
+    print("=" * 60)
+
+    # Generate
+    cost_matrix, conflicts = generate_instance(
+        n=n, max_cost=args.max_cost, n_conflicts=args.n_conflicts, seed=seed
+    )
+
+    # Display
+    print_matrix(cost_matrix, "COST MATRIX")
+    print_conflicts(conflicts, n)
+    print_conflict_map(cost_matrix, conflicts, n)
+    print_formulation(cost_matrix, conflicts, n)
+
+    # Solve
+    results = solve_brute_force(cost_matrix, conflicts, n)
+    print_all_matchings(results, conflicts)
+    optimal = print_solution(results, cost_matrix, conflicts, n)
+
+    print(f"\n{'='*60}")
+
+    return cost_matrix, conflicts, results, optimal
+
+
+if __name__ == "__main__":
+    main()
