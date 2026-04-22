@@ -26,47 +26,51 @@ from collections import defaultdict
 def generate_instance(n=10, num_conflicts=20, seed=None, conflict_density=None):
     """
     n x n bipartite assignment problem with conflicts üretir.
-    Her çalıştırmada farklı instance üretir (seed=None ise).
+    PDF Algorithm 1, Line 1'e uygun:
+      - İlk n edge E0 = {(0,0),(1,1),...,(n-1,n-1)} feasible assignment, conflict-free
+      - Conflict'ler SADECE E0 dışındaki edge'ler arasında üretilir
 
     Args:
         n: problem boyutu
         num_conflicts: explicit conflict sayısı (conflict_density verilmezse)
         seed: None ise her seferinde farklı, int verilirse tekrarlanabilir
         conflict_density: 0.0-1.0 arası, verilirse num_conflicts'i override eder
-                          max possible = n^2*(n-1)^2/2 (farklı satır+sütun çiftleri)
     """
     if seed is None:
         seed = int(time.time() * 1000) % (2**31)
     rng = random.Random(seed)
     np_rng = np.random.RandomState(seed % (2**31))
 
+    # E0: diagonal assignment — guaranteed feasible, no conflicts touch these edges
+    E0 = set((i, i) for i in range(n))
+
+    # E0 dışındaki edge'ler (conflict'ler sadece bunlardan üretilir)
+    non_E0_edges = [(i, j) for i in range(n) for j in range(n) if (i, j) not in E0]
+
     # Conflict density verilmişse num_conflicts hesapla
     if conflict_density is not None:
-        # Farklı satır VE farklı sütundan olabilecek edge çifti sayısı
+        # non-E0 edge'ler arasında farklı satır VE farklı sütun olan çift sayısı
         max_possible = 0
-        for i1 in range(n):
-            for j1 in range(n):
-                for i2 in range(i1 + 1, n):
-                    for j2 in range(n):
-                        if j1 != j2:
-                            max_possible += 1
+        for idx1 in range(len(non_E0_edges)):
+            i1, j1 = non_E0_edges[idx1]
+            for idx2 in range(idx1 + 1, len(non_E0_edges)):
+                i2, j2 = non_E0_edges[idx2]
+                if i1 != i2 and j1 != j2:
+                    max_possible += 1
         num_conflicts = max(1, int(conflict_density * max_possible))
 
     # Cost matrix: rastgele ağırlıklar [1, 100]
     cost_matrix = np_rng.randint(1, 101, size=(n, n)).tolist()
 
-    # Tüm edge'ler
-    all_edges = [(i, j) for i in range(n) for j in range(n)]
-
-    # Conflict üretimi: rastgele edge çiftleri (farklı satır VE farklı sütun)
+    # Conflict üretimi: SADECE non-E0 edge çiftleri (farklı satır VE farklı sütun)
     conflicts = []
     conflict_set = set()
     attempts = 0
     max_attempts = num_conflicts * 200
     while len(conflicts) < num_conflicts and attempts < max_attempts:
         attempts += 1
-        e1 = rng.choice(all_edges)
-        e2 = rng.choice(all_edges)
+        e1 = rng.choice(non_E0_edges)
+        e2 = rng.choice(non_E0_edges)
         if e1 == e2:
             continue
         if e1[0] == e2[0] or e1[1] == e2[1]:
@@ -266,9 +270,9 @@ def subgradient_solve(instance, K_max=500, epsilon=1e-6):
         # Line 10: Solve Max Weight Assignment with p_tilde via Hungarian
         x_star, z_star = hungarian_max(p_tilde)
 
-        # Step 2 – Lagrangian upper bound (Line 11)
+        # Step 2 – Lagrangian upper bound (Line 11) — unconditionally set
         Z_Lag = z_star + float(np.sum(lambdas))
-        UB = min(UB, Z_Lag)
+        UB = Z_Lag
 
         # Assignment matrix (vectorized feasibility check)
         asgn_mat = np.zeros(n * n, dtype=bool)
@@ -283,7 +287,24 @@ def subgradient_solve(instance, K_max=500, epsilon=1e-6):
             has_violations = False
 
         if not has_violations:
-            # Conflict-free — LB update
+            # Conflict-free — Complementary Slackness check (PDF Lines 13-15)
+            if num_conflicts > 0:
+                # x*_e + x*_f = 1 for all {e,f} with lambda > 0?
+                active = lambdas > 0
+                if np.any(active):
+                    xe_act = asgn_mat[c_e1_flat[active]].astype(float)
+                    xf_act = asgn_mat[c_e2_flat[active]].astype(float)
+                    cs_satisfied = np.all((xe_act + xf_act) == 1.0)
+                else:
+                    cs_satisfied = True
+                if cs_satisfied:
+                    obj = float(sum(cost[i, j] for i, j in x_star))
+                    print(f"  Iteration {k}: Complementary Slackness satisfied — OPTIMAL")
+                    LB = obj
+                    x_LB = x_star
+                    break
+
+            # LB update
             obj = float(sum(cost[i, j] for i, j in x_star))
             if obj > LB:
                 LB = obj
